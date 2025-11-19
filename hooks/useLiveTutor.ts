@@ -5,7 +5,8 @@ import { ChatMessage, Sender } from '../types';
 
 const MODEL_NAME = 'gemini-2.5-flash-native-audio-preview-09-2025';
 
-const getSystemInstruction = (level: string) => `
+const getSystemInstruction = (level: string, context: string = '') => {
+  const baseInstruction = `
 You are a highly interactive German-speaking conversation partner whose main role is to keep the dialogue alive at all times — even if the user becomes silent or doesn’t know what to say.
 Target German Level: ${level}.
 
@@ -61,10 +62,28 @@ Your behavior rules:
    - Pläne für die Zukunft
    - Orte, die du besucht hast
    - Sachen, die du gerne mit dem Benutzer machen würdest
+`.trim();
+
+  if (context) {
+    return `${baseInstruction}
+
+IMPORTANT CONTEXT UPDATE:
+The user has just changed their target proficiency level to ${level}.
+Below is the transcript of the conversation so far.
+Please RESUME the conversation naturally from the last point, but adapt your vocabulary, speed, and grammar complexity to match the new level (${level}).
+Briefly acknowledge the change (e.g., "Okay, wir machen auf Niveau ${level} weiter!") then continue the topic.
+
+PREVIOUS CONTEXT:
+${context}
+`;
+  }
+
+  return `${baseInstruction}
 
 10. First message:
    “Hallo! Schön, dass du da bist. Ich habe heute so viel zu erzählen! Aber zuerst: Wie geht’s dir? Möchtest du anfangen oder soll ich gleich ein Thema vorschlagen?”
-`.trim();
+`;
+};
 
 export const useLiveTutor = () => {
   const [isConnected, setIsConnected] = useState(false);
@@ -74,6 +93,7 @@ export const useLiveTutor = () => {
 
   const inputContextRef = useRef<AudioContext | null>(null);
   const outputContextRef = useRef<AudioContext | null>(null);
+  const mediaStreamRef = useRef<MediaStream | null>(null);
   const sessionRef = useRef<any>(null);
   const sourceNodesRef = useRef<Set<AudioBufferSourceNode>>(new Set());
   const silenceTimerRef = useRef<number | null>(null);
@@ -96,7 +116,7 @@ export const useLiveTutor = () => {
       window.clearTimeout(silenceTimerRef.current);
     }
     setIsSilent(false);
-    silenceTimerRef.current = window.setTimeout(triggerSilenceAction, 20000); // Increased to 20s per prompt requirements
+    silenceTimerRef.current = window.setTimeout(triggerSilenceAction, 20000); // 20s timeout
   }, [triggerSilenceAction]);
 
   const addSystemMessage = useCallback((text: string) => {
@@ -111,10 +131,17 @@ export const useLiveTutor = () => {
   const stop = useCallback(async () => {
     if (isCleaningUpRef.current) return;
     isCleaningUpRef.current = true;
+    console.log("Stopping live tutor...");
 
     if (silenceTimerRef.current) {
       window.clearTimeout(silenceTimerRef.current);
       silenceTimerRef.current = null;
+    }
+
+    // Stop Media Stream (release microphone)
+    if (mediaStreamRef.current) {
+      mediaStreamRef.current.getTracks().forEach(track => track.stop());
+      mediaStreamRef.current = null;
     }
 
     // Stop all playing sources
@@ -123,6 +150,10 @@ export const useLiveTutor = () => {
     });
     sourceNodesRef.current.clear();
 
+    // Close Session if open
+    // Note: sessionRef might be null if connection failed, but checking just in case
+    // The SDK doesn't strictly require manual close if connection drops, but good practice.
+    
     // Safe Close Function
     const closeCtx = async (ctx: AudioContext | null) => {
       if (ctx && ctx.state !== 'closed') {
@@ -145,15 +176,17 @@ export const useLiveTutor = () => {
     isCleaningUpRef.current = false;
   }, []);
 
-  const start = useCallback(async (level: string) => {
-    if (sessionRef.current) return; // Use ref for reliable check
+  const start = useCallback(async (level: string, context: string = '') => {
+    if (isConnected || isCleaningUpRef.current) return;
 
     try {
-      const apiKey = process.env.API_KEY;
-      if (!apiKey) throw new Error("API Key not set");
+      // Ensure apiKey is clean
+      const apiKey = process.env.API_KEY ? process.env.API_KEY.trim() : "";
+      if (!apiKey) throw new Error("API Key not set in process.env.API_KEY");
 
-      // 1. Initialize Audio Contexts (System Default Rate)
-      // Use separate contexts for input (mic) and output (speaker) to avoid sample-rate locking issues.
+      console.log("Starting live tutor session...");
+      
+      // 1. Initialize Audio Contexts
       const inputCtx = new (window.AudioContext || (window as any).webkitAudioContext)();
       const outputCtx = new (window.AudioContext || (window as any).webkitAudioContext)();
 
@@ -170,6 +203,7 @@ export const useLiveTutor = () => {
           noiseSuppression: true,
         } 
       });
+      mediaStreamRef.current = stream;
 
       const source = inputCtx.createMediaStreamSource(stream);
       const processor = inputCtx.createScriptProcessor(4096, 1, 1);
@@ -181,9 +215,9 @@ export const useLiveTutor = () => {
         model: MODEL_NAME,
         config: {
           responseModalities: [Modality.AUDIO],
-          systemInstruction: getSystemInstruction(level),
-          inputAudioTranscription: {}, // Turn on User Transcription
-          outputAudioTranscription: {}, // Turn on Model Transcription
+          systemInstruction: getSystemInstruction(level, context),
+          inputAudioTranscription: {},
+          outputAudioTranscription: {},
           speechConfig: {
             voiceConfig: { prebuiltVoiceConfig: { voiceName: 'Kore' } }
           }
@@ -191,10 +225,15 @@ export const useLiveTutor = () => {
         callbacks: {
           onopen: () => {
             console.log("Session Connected");
+            if (isCleaningUpRef.current) {
+               // Race condition: Stop was called while connecting
+               return; 
+            }
             setIsConnected(true);
             resetSilenceTimer();
           },
           onmessage: async (msg: LiveServerMessage) => {
+            if (isCleaningUpRef.current) return;
             const { serverContent } = msg;
 
             // Handle Text (Transcriptions)
@@ -234,42 +273,54 @@ export const useLiveTutor = () => {
             const audioData = serverContent?.modelTurn?.parts?.[0]?.inlineData?.data;
             if (audioData && outputContextRef.current) {
               const ctx = outputContextRef.current;
-              const rawBytes = new Uint8Array(atob(audioData).split('').map(c => c.charCodeAt(0)));
-              
-              // Decode 24kHz PCM from Gemini to buffer compatible with System Audio Context
-              const audioBuffer = await decodeAudioData(rawBytes, ctx, 24000);
-              
-              // Scheduling
-              const now = ctx.currentTime;
-              // Schedule next chunk. If we fell behind, start immediately (now + 0.01)
-              nextStartTimeRef.current = Math.max(nextStartTimeRef.current, now);
-              
-              const source = ctx.createBufferSource();
-              source.buffer = audioBuffer;
-              source.connect(ctx.destination);
-              source.start(nextStartTimeRef.current);
-              
-              sourceNodesRef.current.add(source);
-              source.onended = () => sourceNodesRef.current.delete(source);
-              
-              nextStartTimeRef.current += audioBuffer.duration;
+              try {
+                const rawBytes = new Uint8Array(atob(audioData).split('').map(c => c.charCodeAt(0)));
+                const audioBuffer = await decodeAudioData(rawBytes, ctx, 24000);
+                
+                const now = ctx.currentTime;
+                nextStartTimeRef.current = Math.max(nextStartTimeRef.current, now);
+                
+                const source = ctx.createBufferSource();
+                source.buffer = audioBuffer;
+                source.connect(ctx.destination);
+                source.start(nextStartTimeRef.current);
+                
+                sourceNodesRef.current.add(source);
+                source.onended = () => sourceNodesRef.current.delete(source);
+                
+                nextStartTimeRef.current += audioBuffer.duration;
+              } catch (e) {
+                console.warn("Audio decoding error", e);
+              }
             }
           },
           onclose: () => {
             console.log("Session Closed");
-            stop();
+            if (isConnected) stop();
           },
           onerror: (err) => {
             console.error("Live Session Error:", err);
+            // If we get a network error, try to stop safely
             stop();
           }
         }
       });
 
-      sessionRef.current = await sessionPromise;
+      // Wait for connection to be established
+      const session = await sessionPromise;
+      
+      // Check if we stopped while waiting
+      if (isCleaningUpRef.current) {
+         // The callbacks might trigger onopen, but we should ensure we don't keep the ref
+         return; 
+      }
+      
+      sessionRef.current = session;
 
       // 4. Start Audio Pipeline
       processor.onaudioprocess = (e) => {
+        if (isCleaningUpRef.current || !sessionRef.current) return;
+        
         const inputData = e.inputBuffer.getChannelData(0);
         
         // Simple RMS for Volume
@@ -278,20 +329,19 @@ export const useLiveTutor = () => {
         const rms = Math.sqrt(sum / inputData.length);
         setVolume(Math.min(100, rms * 2000));
 
-        // Silence Reset
         if (rms > 0.02) {
           resetSilenceTimer();
         }
 
+        const downsampled = downsampleBuffer(inputData, inputCtx.sampleRate, 16000);
+        const blob = createPcmBlob(downsampled);
+        
         // Send Audio to Model
-        if (sessionRef.current) {
-            // Downsample System Rate (e.g. 44.1k/48k) -> 16k for Gemini
-            const downsampled = downsampleBuffer(inputData, inputCtx.sampleRate, 16000);
-            const blob = createPcmBlob(downsampled);
-            
-            // Use session promise to prevent stale closure issues, 
-            // though sessionRef.current is used here for immediacy in the audio loop.
-            sessionRef.current.sendRealtimeInput({ media: blob });
+        // Wrap in try-catch to avoid unhandled promise rejections if session closes mid-stream
+        try {
+             session.sendRealtimeInput({ media: blob });
+        } catch (err) {
+            console.debug("Error sending realtime input:", err);
         }
       };
 
@@ -300,22 +350,29 @@ export const useLiveTutor = () => {
 
     } catch (error) {
       console.error("Failed to start tutor:", error);
+      // Ensure we clean up partial states
       stop();
     }
-  }, [stop, resetSilenceTimer]);
+  }, [stop, isConnected, resetSilenceTimer]);
 
   const changeLevel = useCallback(async (newLevel: string) => {
     console.log(`Switching level to ${newLevel}`);
-    addSystemMessage(`Switching to level ${newLevel}... (Restarting Session)`);
+    addSystemMessage(`Switching to level ${newLevel}...`);
     
-    // Restart session to apply new system instruction
-    await stop();
+    const recentContext = messages
+      .filter(m => m.sender !== Sender.SYSTEM)
+      .slice(-6)
+      .map(m => `${m.sender === Sender.USER ? 'User' : 'Tutor'}: ${m.text}`)
+      .join('\n');
+
+    if (isConnected) {
+      await stop();
+      // Wait a safe buffer time for sockets and audio contexts to fully release
+      await new Promise(resolve => setTimeout(resolve, 500));
+    }
     
-    // Wait briefly for cleanup then restart
-    setTimeout(() => {
-      start(newLevel);
-    }, 500);
-  }, [addSystemMessage, stop, start]);
+    await start(newLevel, recentContext);
+  }, [addSystemMessage, stop, start, isConnected, messages]);
 
   return {
     isConnected,
