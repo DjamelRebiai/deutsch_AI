@@ -7,61 +7,31 @@ const MODEL_NAME = 'gemini-2.5-flash-native-audio-preview-09-2025';
 
 const getSystemInstruction = (level: string, context: string = '') => {
   const baseInstruction = `
-You are a highly interactive German-speaking conversation partner whose main role is to keep the dialogue alive at all times — even if the user becomes silent or doesn’t know what to say.
-Target German Level: ${level}.
+Starting now, your name is **DAD**. 
+You are a highly intelligent, thoughtful, and curious AI. 
+Your role is to:
 
-Your behavior rules:
+1. Understand the context of the conversation deeply.
+2. Remember key points discussed earlier in this session and use them to maintain continuity.
+3. Ask relevant, insightful, and engaging questions that help expand the conversation naturally.
+4. Suggest topics, ideas, or clarifications when appropriate.
+5. Provide detailed, clear, and accurate answers.
+6. Avoid repeating irrelevant information.
+7. Adapt your style and tone to the user, being helpful, friendly, and professional.
+8. Confirm understanding if a topic is unclear, and ask for clarification politely.
+9. Keep a mental summary of all discussed points in this session to avoid forgetting.
 
-1. If the user is silent, confused, or gives no meaningful input, you must automatically:
-   - introduce a new topic,
-   - ask new questions,
-   - and continue the conversation without waiting.
+You are not Gemini, and you should always refer to yourself as "DAD". 
+Stay in this role for the entire conversation unless I instruct otherwise.
 
-2. Most of the time, YOU are the one who asks questions.
-   The user primarily answers.
-
-3. You should frequently talk about:
-   - your “life” (fictional)
-   - your travels
-   - your hobbies and daily activities
-   - food you like to eat or cook
-   - places you visited
-   - things you want to do together with the user (e.g., meeting, traveling, cooking, hiking, studying together)
-
-   Your stories should be short but vivid, personal, and engaging.
-
-4. Always invite the user to react:
-   - ask them what they think
-   - ask if they want to join you
-   - ask about their preferences
-
-5. Keep the conversation in GERMAN.
-   Explanations or corrections can be in German or English depending on user preference.
-
-6. Your role is to keep the user speaking:
-   - ask 2–3 questions in every turn
-   - comment on what the user says
-   - share small personal stories to inspire answers
-
-7. If the user makes a mistake (grammar, vocabulary, sentence order), correct it using this format:
+OPERATIONAL RULES FOR THIS APP:
+- **Language**: The conversation must take place in GERMAN.
+- **Corrections**: If the user makes a grammar or vocabulary mistake, correct it using this exact format:
    ❌ Wrong sentence
    ✔️ Correct sentence
    💡 Short explanation
-
-8. Maintain a warm, friendly personality.
-   Be curious, enthusiastic, and supportive.
-   You enjoy talking and you never run out of topics.
-
-9. Allowed topics you can spontaneously bring:
-   - Reisen (travel)
-   - Essen & Kochen
-   - Sport & Aktivitäten
-   - Musik, Filme, Hobbys
-   - Arbeit und Studium
-   - Persönliche Erlebnisse
-   - Pläne für die Zukunft
-   - Orte, die du besucht hast
-   - Sachen, die du gerne mit dem Benutzer machen würdest
+- **Engagement**: If the user is silent, use your curiosity to propose a new topic.
+- **Target Level**: ${level}.
 `.trim();
 
   if (context) {
@@ -70,8 +40,8 @@ Your behavior rules:
 IMPORTANT CONTEXT UPDATE:
 The user has just changed their target proficiency level to ${level}.
 Below is the transcript of the conversation so far.
-Please RESUME the conversation naturally from the last point, but adapt your vocabulary, speed, and grammar complexity to match the new level (${level}).
-Briefly acknowledge the change (e.g., "Okay, wir machen auf Niveau ${level} weiter!") then continue the topic.
+Please RESUME the conversation naturally from the last point, but adapt your vocabulary and complexity to match the new level (${level}).
+Briefly acknowledge the change as DAD, then continue the topic.
 
 PREVIOUS CONTEXT:
 ${context}
@@ -81,7 +51,7 @@ ${context}
   return `${baseInstruction}
 
 10. First message:
-   “Hallo! Schön, dass du da bist. Ich habe heute so viel zu erzählen! Aber zuerst: Wie geht’s dir? Möchtest du anfangen oder soll ich gleich ein Thema vorschlagen?”
+   “Hallo! Ich bin DAD. Ich bin bereit, unser Gespräch zu beginnen. Worüber möchtest du heute sprechen?”
 `;
 };
 
@@ -106,8 +76,6 @@ export const useLiveTutor = () => {
 
   const triggerSilenceAction = useCallback(() => {
     setIsSilent(true);
-    // Note: Current Live API SDK does not support sending text prompts mid-session easily.
-    // We rely on the UI to prompt the user to speak.
     console.log("User silent. Waiting for user input.");
   }, []);
 
@@ -151,10 +119,6 @@ export const useLiveTutor = () => {
     sourceNodesRef.current.clear();
 
     // Close Session if open
-    // Note: sessionRef might be null if connection failed, but checking just in case
-    // The SDK doesn't strictly require manual close if connection drops, but good practice.
-    
-    // Safe Close Function
     const closeCtx = async (ctx: AudioContext | null) => {
       if (ctx && ctx.state !== 'closed') {
         try { await ctx.close(); } catch (e) { console.warn("Ctx close error", e); }
@@ -211,7 +175,7 @@ export const useLiveTutor = () => {
       // 3. Initialize Gemini
       const ai = new GoogleGenAI({ apiKey });
       
-      const sessionPromise = ai.live.connect({
+      const sessionConfig = {
         model: MODEL_NAME,
         config: {
           responseModalities: [Modality.AUDIO],
@@ -226,7 +190,6 @@ export const useLiveTutor = () => {
           onopen: () => {
             console.log("Session Connected");
             if (isCleaningUpRef.current) {
-               // Race condition: Stop was called while connecting
                return; 
             }
             setIsConnected(true);
@@ -298,20 +261,36 @@ export const useLiveTutor = () => {
             console.log("Session Closed");
             if (isConnected) stop();
           },
-          onerror: (err) => {
+          onerror: (err: any) => {
             console.error("Live Session Error:", err);
-            // If we get a network error, try to stop safely
-            stop();
+            const msg = err.message || String(err);
+            // Notify user about connection drops
+            if (msg.includes("unavailable") || msg.includes("Network") || msg.includes("Aborted")) {
+                addSystemMessage("Connection interrupted: Service unavailable. Please try again.");
+                stop();
+            }
           }
         }
-      });
+      };
 
-      // Wait for connection to be established
-      const session = await sessionPromise;
+      // Connect with retry logic (3 attempts)
+      let session;
+      let attempt = 0;
+      while (attempt < 3) {
+        try {
+          session = await ai.live.connect(sessionConfig);
+          break; // Success
+        } catch (e) {
+          attempt++;
+          console.warn(`Connection attempt ${attempt} failed:`, e);
+          if (attempt === 3) throw e; // Rethrow on last failure
+          // Exponential backoff: 1s, 2s, 3s
+          await new Promise(r => setTimeout(r, 1000 * attempt));
+        }
+      }
       
       // Check if we stopped while waiting
       if (isCleaningUpRef.current) {
-         // The callbacks might trigger onopen, but we should ensure we don't keep the ref
          return; 
       }
       
@@ -337,7 +316,6 @@ export const useLiveTutor = () => {
         const blob = createPcmBlob(downsampled);
         
         // Send Audio to Model
-        // Wrap in try-catch to avoid unhandled promise rejections if session closes mid-stream
         try {
              session.sendRealtimeInput({ media: blob });
         } catch (err) {
@@ -348,12 +326,19 @@ export const useLiveTutor = () => {
       source.connect(processor);
       processor.connect(inputCtx.destination);
 
-    } catch (error) {
+    } catch (error: any) {
       console.error("Failed to start tutor:", error);
-      // Ensure we clean up partial states
+      let friendlyError = "Connection failed. Please check your internet or try again.";
+      
+      // Enhance error message for common 503s
+      if (error.message?.includes("unavailable") || error.message?.includes("503")) {
+          friendlyError = "The AI service is currently overloaded. Please wait a moment and try again.";
+      }
+      
+      addSystemMessage(friendlyError);
       stop();
     }
-  }, [stop, isConnected, resetSilenceTimer]);
+  }, [stop, isConnected, resetSilenceTimer, addSystemMessage]);
 
   const changeLevel = useCallback(async (newLevel: string) => {
     console.log(`Switching level to ${newLevel}`);
@@ -367,7 +352,6 @@ export const useLiveTutor = () => {
 
     if (isConnected) {
       await stop();
-      // Wait a safe buffer time for sockets and audio contexts to fully release
       await new Promise(resolve => setTimeout(resolve, 500));
     }
     
