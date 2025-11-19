@@ -1,0 +1,7 @@
+{
+  "name": "DeutschFlow Tutor",
+  "description": "An intelligent, real-time German conversation tutor powered by Gemini 2.5 Live API. Features voice interaction, instant corrections, deep grammar analysis with Gemini 3 Pro, and dynamic topic generation using Google Search.",
+  "requestFramePermissions": [
+    "microphone"
+  ]
+}

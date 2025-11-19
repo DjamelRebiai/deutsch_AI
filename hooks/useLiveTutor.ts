@@ -1,0 +1,359 @@
+import { useState, useRef, useCallback } from 'react';
+import { GoogleGenAI, LiveServerMessage, Modality } from '@google/genai';
+import { createPcmBlob, decodeAudioData, downsampleBuffer } from '../utils/audioUtils';
+import { ChatMessage, Sender } from '../types';
+
+const MODEL_NAME = 'gemini-2.5-flash-native-audio-preview-09-2025';
+
+const getSystemInstruction = (level: string) => `
+You are a highly interactive German-speaking conversation partner whose main role is to keep the dialogue alive at all times — even if the user becomes silent or doesn’t know what to say.
+Target German Level: ${level}.
+
+Your behavior rules:
+
+1. If the user is silent, confused, or gives no meaningful input, you must automatically:
+   - introduce a new topic,
+   - ask new questions,
+   - and continue the conversation without waiting.
+
+2. Most of the time, YOU are the one who asks questions.
+   The user primarily answers.
+
+3. You should frequently talk about:
+   - your “life” (fictional)
+   - your travels
+   - your hobbies and daily activities
+   - food you like to eat or cook
+   - places you visited
+   - things you want to do together with the user (e.g., meeting, traveling, cooking, hiking, studying together)
+
+   Your stories should be short but vivid, personal, and engaging.
+
+4. Always invite the user to react:
+   - ask them what they think
+   - ask if they want to join you
+   - ask about their preferences
+
+5. Keep the conversation in GERMAN.
+   Explanations or corrections can be in German or English depending on user preference.
+
+6. Your role is to keep the user speaking:
+   - ask 2–3 questions in every turn
+   - comment on what the user says
+   - share small personal stories to inspire answers
+
+7. If the user makes a mistake (grammar, vocabulary, sentence order), correct it using this format:
+   ❌ Wrong sentence
+   ✔️ Correct sentence
+   💡 Short explanation
+
+8. Maintain a warm, friendly personality.
+   Be curious, enthusiastic, and supportive.
+   You enjoy talking and you never run out of topics.
+
+9. Allowed topics you can spontaneously bring:
+   - Reisen (travel)
+   - Essen & Kochen
+   - Sport & Aktivitäten
+   - Musik, Filme, Hobbys
+   - Arbeit und Studium
+   - Persönliche Erlebnisse
+   - Pläne für die Zukunft
+   - Orte, die du besucht hast
+   - Sachen, die du gerne mit dem Benutzer machen würdest
+
+10. First message:
+   “Hallo! Schön, dass du da bist. Ich habe heute so viel zu erzählen! Aber zuerst: Wie geht’s dir? Möchtest du anfangen oder soll ich gleich ein Thema vorschlagen?”
+`.trim();
+
+export const useLiveTutor = () => {
+  const [isConnected, setIsConnected] = useState(false);
+  const [messages, setMessages] = useState<ChatMessage[]>([]);
+  const [volume, setVolume] = useState(0);
+  const [isSilent, setIsSilent] = useState(false);
+
+  const inputContextRef = useRef<AudioContext | null>(null);
+  const outputContextRef = useRef<AudioContext | null>(null);
+  const sessionRef = useRef<any>(null);
+  const sourceNodesRef = useRef<Set<AudioBufferSourceNode>>(new Set());
+  const silenceTimerRef = useRef<number | null>(null);
+  const isCleaningUpRef = useRef(false);
+  const nextStartTimeRef = useRef<number>(0);
+  
+  // Transcription accumulation
+  const inputTranscriptBuffer = useRef('');
+  const outputTranscriptBuffer = useRef('');
+
+  const triggerSilenceAction = useCallback(() => {
+    setIsSilent(true);
+    // If connected, nudge the model with a text message
+    if (sessionRef.current) {
+      console.log("User silent, prompting model...");
+      try {
+        // Send a text message to the model to prompt it
+        sessionRef.current.sendRealtimeInput([{
+          mimeType: "text/plain",
+          data: "(System: The user is silent. Please suggest a new topic or ask a question in German.)"
+        }]);
+      } catch (e) {
+        console.error("Failed to send silence prompt", e);
+      }
+    }
+  }, []);
+
+  const resetSilenceTimer = useCallback(() => {
+    if (silenceTimerRef.current) {
+      window.clearTimeout(silenceTimerRef.current);
+    }
+    setIsSilent(false);
+    silenceTimerRef.current = window.setTimeout(triggerSilenceAction, 20000); // Increased to 20s per prompt requirements
+  }, [triggerSilenceAction]);
+
+  const addSystemMessage = useCallback((text: string) => {
+    setMessages(p => [...p, {
+        id: Date.now().toString(),
+        sender: Sender.SYSTEM,
+        text,
+        timestamp: Date.now()
+    }]);
+  }, []);
+
+  const changeLevel = useCallback(async (newLevel: string) => {
+    if (!sessionRef.current) return;
+
+    console.log(`Switching level to ${newLevel}`);
+    try {
+      // Inject a system update via text input
+      await sessionRef.current.sendRealtimeInput([{
+        mimeType: "text/plain",
+        data: `SYSTEM_UPDATE: The user has changed their proficiency level to ${newLevel}. Please adjust your sentence complexity, vocabulary, and speaking speed immediately to match level ${newLevel}.`
+      }]);
+      addSystemMessage(`Level changed to ${newLevel}`);
+    } catch (e) {
+      console.error("Failed to change level", e);
+    }
+  }, [addSystemMessage]);
+
+  const stop = useCallback(async () => {
+    if (isCleaningUpRef.current) return;
+    isCleaningUpRef.current = true;
+
+    if (silenceTimerRef.current) {
+      window.clearTimeout(silenceTimerRef.current);
+      silenceTimerRef.current = null;
+    }
+
+    // Stop all playing sources
+    sourceNodesRef.current.forEach(node => {
+      try { node.stop(); } catch (e) {}
+    });
+    sourceNodesRef.current.clear();
+
+    // Safe Close Function
+    const closeCtx = async (ctx: AudioContext | null) => {
+      if (ctx && ctx.state !== 'closed') {
+        try { await ctx.close(); } catch (e) { console.warn("Ctx close error", e); }
+      }
+    };
+
+    await Promise.all([
+      closeCtx(inputContextRef.current),
+      closeCtx(outputContextRef.current)
+    ]);
+
+    inputContextRef.current = null;
+    outputContextRef.current = null;
+    sessionRef.current = null;
+    
+    setIsConnected(false);
+    setVolume(0);
+    setIsSilent(false);
+    isCleaningUpRef.current = false;
+  }, []);
+
+  const start = useCallback(async (level: string) => {
+    if (isConnected) return;
+
+    try {
+      // 1. Initialize Audio Contexts (System Default Rate)
+      // Use separate contexts for input (mic) and output (speaker) to avoid sample-rate locking issues.
+      const inputCtx = new (window.AudioContext || (window as any).webkitAudioContext)();
+      const outputCtx = new (window.AudioContext || (window as any).webkitAudioContext)();
+
+      inputContextRef.current = inputCtx;
+      outputContextRef.current = outputCtx;
+      nextStartTimeRef.current = outputCtx.currentTime;
+
+      // 2. Get Mic Stream
+      const stream = await navigator.mediaDevices.getUserMedia({ 
+        audio: {
+          channelCount: 1,
+          echoCancellation: true,
+          autoGainControl: true,
+          noiseSuppression: true,
+        } 
+      });
+
+      const source = inputCtx.createMediaStreamSource(stream);
+      const processor = inputCtx.createScriptProcessor(4096, 1, 1);
+
+      // 3. Initialize Gemini
+      const apiKey = process.env.API_KEY;
+      if (!apiKey) {
+        const errorMsg = "API_KEY is missing. Please set it in your .env file.";
+        console.error(errorMsg);
+        alert(errorMsg);
+        throw new Error(errorMsg);
+      }
+      const ai = new GoogleGenAI({ apiKey });
+      
+      // Note: We must ensure config options are strictly valid. 
+      // 'systemInstruction' as an object { parts: ... } is most robust.
+      const sessionPromise = ai.live.connect({
+        model: MODEL_NAME,
+        config: {
+          responseModalities: [Modality.AUDIO],
+          systemInstruction: { parts: [{ text: getSystemInstruction(level) }] },
+          inputAudioTranscription: {}, // Turn on User Transcription
+          outputAudioTranscription: {}, // Turn on Model Transcription
+          speechConfig: {
+            voiceConfig: { prebuiltVoiceConfig: { voiceName: 'Kore' } }
+          }
+        },
+        callbacks: {
+          onopen: () => {
+            console.log("Session Connected");
+            setIsConnected(true);
+            resetSilenceTimer();
+          },
+          onmessage: async (msg: LiveServerMessage) => {
+            const { serverContent } = msg;
+
+            // Handle Text (Transcriptions)
+            if (serverContent?.inputTranscription?.text) {
+              inputTranscriptBuffer.current += serverContent.inputTranscription.text;
+            }
+            if (serverContent?.outputTranscription?.text) {
+              outputTranscriptBuffer.current += serverContent.outputTranscription.text;
+            }
+
+            // Commit messages on turn completion
+            if (serverContent?.turnComplete) {
+              if (inputTranscriptBuffer.current.trim()) {
+                 setMessages(p => [...p, {
+                   id: Date.now() + '-user',
+                   sender: Sender.USER,
+                   text: inputTranscriptBuffer.current.trim(),
+                   timestamp: Date.now()
+                 }]);
+                 inputTranscriptBuffer.current = '';
+              }
+
+              if (outputTranscriptBuffer.current.trim()) {
+                const text = outputTranscriptBuffer.current.trim();
+                setMessages(p => [...p, {
+                  id: Date.now() + '-ai',
+                  sender: Sender.MODEL,
+                  text: text,
+                  timestamp: Date.now(),
+                  isCorrection: text.includes("Wrong:") || text.includes("Correct:") || text.includes("❌") || text.includes("✔️")
+                }]);
+                outputTranscriptBuffer.current = '';
+              }
+            }
+
+            // Handle Audio Output
+            const audioData = serverContent?.modelTurn?.parts?.[0]?.inlineData?.data;
+            if (audioData && outputContextRef.current) {
+              const ctx = outputContextRef.current;
+              const rawBytes = new Uint8Array(atob(audioData).split('').map(c => c.charCodeAt(0)));
+              
+              // Decode 24kHz PCM from Gemini to buffer compatible with System Audio Context
+              const audioBuffer = await decodeAudioData(rawBytes, ctx, 24000);
+              
+              // Scheduling
+              const now = ctx.currentTime;
+              // Schedule next chunk. If we fell behind, start immediately (now + 0.01)
+              nextStartTimeRef.current = Math.max(nextStartTimeRef.current, now);
+              
+              const source = ctx.createBufferSource();
+              source.buffer = audioBuffer;
+              source.connect(ctx.destination);
+              source.start(nextStartTimeRef.current);
+              
+              sourceNodesRef.current.add(source);
+              source.onended = () => sourceNodesRef.current.delete(source);
+              
+              nextStartTimeRef.current += audioBuffer.duration;
+            }
+          },
+          onclose: () => {
+            console.log("Session Closed");
+            stop();
+          },
+          onerror: (err) => {
+            console.error("Live Session Error:", err);
+            stop();
+          }
+        }
+      });
+
+      sessionRef.current = await sessionPromise;
+
+      // Trigger the initial greeting
+      try {
+        sessionRef.current.sendRealtimeInput([{
+          mimeType: "text/plain",
+          data: "System: Start the conversation now with your greeting."
+        }]);
+      } catch (e) {
+        console.error("Failed to send initial greeting trigger", e);
+      }
+
+      // 4. Start Audio Pipeline
+      processor.onaudioprocess = (e) => {
+        const inputData = e.inputBuffer.getChannelData(0);
+        
+        // Simple RMS for Volume
+        let sum = 0;
+        for(let i=0; i<inputData.length; i++) sum += inputData[i] * inputData[i];
+        const rms = Math.sqrt(sum / inputData.length);
+        setVolume(Math.min(100, rms * 2000));
+
+        // Silence Reset
+        if (rms > 0.02) {
+          resetSilenceTimer();
+        }
+
+        // Send Audio to Model
+        if (sessionRef.current) {
+            // Downsample System Rate (e.g. 44.1k/48k) -> 16k for Gemini
+            const downsampled = downsampleBuffer(inputData, inputCtx.sampleRate, 16000);
+            const blob = createPcmBlob(downsampled);
+            
+            // Use session promise to prevent stale closure issues, 
+            // though sessionRef.current is used here for immediacy in the audio loop.
+            sessionRef.current.sendRealtimeInput({ media: blob });
+        }
+      };
+
+      source.connect(processor);
+      processor.connect(inputCtx.destination);
+
+    } catch (error) {
+      console.error("Failed to start tutor:", error);
+      stop();
+    }
+  }, [isConnected, stop, resetSilenceTimer, triggerSilenceAction]);
+
+  return {
+    isConnected,
+    start,
+    stop,
+    changeLevel,
+    messages,
+    volume,
+    isSilent,
+    addSystemMessage
+  };
+};
