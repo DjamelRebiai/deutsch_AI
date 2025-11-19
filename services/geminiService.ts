@@ -6,7 +6,7 @@ import { NewsTopic } from "../types";
 const getAiClient = () => {
   const apiKey = process.env.API_KEY;
   if (!apiKey) {
-    throw new Error("An API Key must be set in the environment (process.env.API_KEY).");
+    throw new Error("API Key not set. Please check process.env.API_KEY.");
   }
   return new GoogleGenAI({ apiKey });
 };

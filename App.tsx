@@ -92,6 +92,7 @@ export default function App() {
 
   const handleLevelChange = (e: React.ChangeEvent<HTMLSelectElement>) => {
     const newLevel = e.target.value as ProficiencyLevel;
+    console.log("Level selection changed to:", newLevel);
     setLevel(newLevel);
     if (isConnected) {
       changeLevel(newLevel);

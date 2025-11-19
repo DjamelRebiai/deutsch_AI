@@ -86,19 +86,9 @@ export const useLiveTutor = () => {
 
   const triggerSilenceAction = useCallback(() => {
     setIsSilent(true);
-    // If connected, nudge the model with a text message
-    if (sessionRef.current) {
-      console.log("User silent, prompting model...");
-      try {
-        // Send a text message to the model to prompt it
-        sessionRef.current.sendRealtimeInput([{
-          mimeType: "text/plain",
-          data: "(System: The user is silent. Please suggest a new topic or ask a question in German.)"
-        }]);
-      } catch (e) {
-        console.error("Failed to send silence prompt", e);
-      }
-    }
+    // Note: Current Live API SDK does not support sending text prompts mid-session easily.
+    // We rely on the UI to prompt the user to speak.
+    console.log("User silent. Waiting for user input.");
   }, []);
 
   const resetSilenceTimer = useCallback(() => {
@@ -117,22 +107,6 @@ export const useLiveTutor = () => {
         timestamp: Date.now()
     }]);
   }, []);
-
-  const changeLevel = useCallback(async (newLevel: string) => {
-    if (!sessionRef.current) return;
-
-    console.log(`Switching level to ${newLevel}`);
-    try {
-      // Inject a system update via text input
-      await sessionRef.current.sendRealtimeInput([{
-        mimeType: "text/plain",
-        data: `SYSTEM_UPDATE: The user has changed their proficiency level to ${newLevel}. Please adjust your sentence complexity, vocabulary, and speaking speed immediately to match level ${newLevel}.`
-      }]);
-      addSystemMessage(`Level changed to ${newLevel}`);
-    } catch (e) {
-      console.error("Failed to change level", e);
-    }
-  }, [addSystemMessage]);
 
   const stop = useCallback(async () => {
     if (isCleaningUpRef.current) return;
@@ -172,9 +146,12 @@ export const useLiveTutor = () => {
   }, []);
 
   const start = useCallback(async (level: string) => {
-    if (isConnected) return;
+    if (sessionRef.current) return; // Use ref for reliable check
 
     try {
+      const apiKey = process.env.API_KEY;
+      if (!apiKey) throw new Error("API Key not set");
+
       // 1. Initialize Audio Contexts (System Default Rate)
       // Use separate contexts for input (mic) and output (speaker) to avoid sample-rate locking issues.
       const inputCtx = new (window.AudioContext || (window as any).webkitAudioContext)();
@@ -198,22 +175,13 @@ export const useLiveTutor = () => {
       const processor = inputCtx.createScriptProcessor(4096, 1, 1);
 
       // 3. Initialize Gemini
-      const apiKey = process.env.API_KEY;
-      if (!apiKey) {
-        const errorMsg = "API_KEY is missing. Please set it in your .env file.";
-        console.error(errorMsg);
-        alert(errorMsg);
-        throw new Error(errorMsg);
-      }
       const ai = new GoogleGenAI({ apiKey });
       
-      // Note: We must ensure config options are strictly valid. 
-      // 'systemInstruction' as an object { parts: ... } is most robust.
       const sessionPromise = ai.live.connect({
         model: MODEL_NAME,
         config: {
           responseModalities: [Modality.AUDIO],
-          systemInstruction: { parts: [{ text: getSystemInstruction(level) }] },
+          systemInstruction: getSystemInstruction(level),
           inputAudioTranscription: {}, // Turn on User Transcription
           outputAudioTranscription: {}, // Turn on Model Transcription
           speechConfig: {
@@ -300,16 +268,6 @@ export const useLiveTutor = () => {
 
       sessionRef.current = await sessionPromise;
 
-      // Trigger the initial greeting
-      try {
-        sessionRef.current.sendRealtimeInput([{
-          mimeType: "text/plain",
-          data: "System: Start the conversation now with your greeting."
-        }]);
-      } catch (e) {
-        console.error("Failed to send initial greeting trigger", e);
-      }
-
       // 4. Start Audio Pipeline
       processor.onaudioprocess = (e) => {
         const inputData = e.inputBuffer.getChannelData(0);
@@ -344,7 +302,20 @@ export const useLiveTutor = () => {
       console.error("Failed to start tutor:", error);
       stop();
     }
-  }, [isConnected, stop, resetSilenceTimer, triggerSilenceAction]);
+  }, [stop, resetSilenceTimer]);
+
+  const changeLevel = useCallback(async (newLevel: string) => {
+    console.log(`Switching level to ${newLevel}`);
+    addSystemMessage(`Switching to level ${newLevel}... (Restarting Session)`);
+    
+    // Restart session to apply new system instruction
+    await stop();
+    
+    // Wait briefly for cleanup then restart
+    setTimeout(() => {
+      start(newLevel);
+    }, 500);
+  }, [addSystemMessage, stop, start]);
 
   return {
     isConnected,
